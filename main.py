@@ -1,25 +1,42 @@
 import dns.resolver
 import socket
-import ssl
 import time
 import random
 import string
 import email.utils
 import uuid
+import asyncio
 from collections import defaultdict
+from typing import List, Optional, Dict, Tuple, Any # Added Any for generic dicts
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
-from typing import List, Optional, Dict, Tuple
 
+# ──────────────────────────────────────────────────────────────────────────────
 # FASTAPI SETUP WITH CORS
+# ──────────────────────────────────────────────────────────────────────────────
+
 app = FastAPI(
     title="SMTP Email Verifier API",
-    description="Batch‐verify email addresses using SMTP‐handshake + timing for catch‐all domains, with extended metadata and CORS enabled for bounso.com.",
-    version="1.2.0"
+    description="Batch-verify and find emails by name using SMTP-handshake + timing for catch-all domains, "
+                "with extended metadata and CORS enabled.",
+    version="1.4.0" # Updated version for email finding feature
 )
-origins = ["https://bounso.com", "http://bounso.com"]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ADD CORS MIDDLEWARE
+# ──────────────────────────────────────────────────────────────────────────────
+
+origins = [
+    "https://bounso.com",
+    "http://bounso.com",
+    "https://owlsquad.com", # New domain allowed
+    "http://owlsquad.com",  # New domain allowed (consider if needed for dev/specific cases)
+    # You may add local dev origins here for local development:
+    # "http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8000"
+]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -28,304 +45,664 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# CONFIGURATION
-FROM_ADDRESS_TEMPLATE = "verify@{}"
-SOCKET_TIMEOUT = 5.0
-NUM_CALIBRATE = 2
-RCPT_RETRIES = 1
-TIMING_CUSHION = 0.05
-FREE_MAIL_DOMAINS = {"gmail.com","yahoo.com","outlook.com","hotmail.com","aol.com","icloud.com","protonmail.com","zoho.com"}
-DISPOSABLE_DOMAINS = {"mailinator.com","10minutemail.com","yopmail.com","tempmail.com","discard.email","guerrillamail.com"}
-ROLE_LOCALS = {"admin","administrator","support","info","sales","marketing","billing","webmaster","postmaster","contact","help","service"}
+# ──────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION (Adjust as needed)
+# ──────────────────────────────────────────────────────────────────────────────
 
-# MODELS
+FROM_ADDRESS_TEMPLATE = "verify@{}"
+SOCKET_TIMEOUT = 5.0 # Timeout for individual socket operations
+NUM_CALIBRATE = 2    # Number of probes for catch-all detection and fake timing
+RCPT_RETRIES = 1     # Retries for RCPT TO (though less common in successful direct verification)
+TIMING_CUSHION = 0.05 # Threshold for timing difference (in seconds).
+
+# Semaphore to limit concurrent SMTP connections to a single mail server.
+# This is crucial to prevent mail servers from rate-limiting or blocking you.
+# Adjust this value based on your observations and server tolerance.
+# A lower value is safer; a higher value is faster (but riskier).
+MAX_CONCURRENT_SMTP_CONNECTIONS_PER_MX = 5
+
+FREE_MAIL_DOMAINS = {
+    "gmail.com", "yahoo.com", "outlook.com", "hotmail.com",
+    "aol.com", "icloud.com", "protonmail.com", "zoho.com"
+}
+
+DISPOSABLE_DOMAINS = {
+    "mailinator.com", "10minutemail.com", "yopmail.com",
+    "tempmail.com", "discard.email", "guerrillamail.com"
+}
+
+ROLE_LOCALS = {
+    "admin", "administrator", "support", "info", "sales", "marketing",
+    "billing", "webmaster", "postmaster", "contact", "help", "service"
+}
+
+# Dictionary to store semaphores per MX host to limit concurrent connections
+mx_semaphores: Dict[str, asyncio.Semaphore] = defaultdict(lambda: asyncio.Semaphore(MAX_CONCURRENT_SMTP_CONNECTIONS_PER_MX))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# REQUEST / RESPONSE MODELS
+# ──────────────────────────────────────────────────────────────────────────────
+
 class VerifyRequest(BaseModel):
-    batch_id: Optional[str]
+    batch_id: Optional[str] = None
     emails: List[EmailStr]
 
+# This defines the structure of results for each email address
+# It's a Pydantic BaseModel for FastAPI
 class PerAddressResult(BaseModel):
     addr: EmailStr
-    mx: Optional[str]
-    mx_provider: Optional[str]
-    deliverability: Optional[str]
-    score: Optional[float]
-    free: Optional[bool]
-    disposable: Optional[bool]
-    role: Optional[bool]
-    catch_all: Optional[bool]
-    result: Optional[str]
-    verification_time: Optional[float]
-    method: Optional[str]
-    status: Optional[str]
-    rcpt_code: Optional[int]
-    rcpt_time: Optional[float]
-    rcpt_msg: Optional[str]
-    data_code: Optional[int]
-    data_msg: Optional[str]
+    mx: Optional[str] = None
+    mx_provider: Optional[str] = None
+    deliverability: Optional[str] = None
+    score: Optional[float] = None
+    free: Optional[bool] = None
+    disposable: Optional[bool] = None
+    role: Optional[bool] = None
+    catch_all: Optional[bool] = None
+    result: Optional[str] = None # 'valid', 'invalid', 'risky', 'risky_catch_all'
+    verification_time: Optional[float] = None
+
+    method: Optional[str] = None # 'timing', 'simple'
+    status: Optional[str] = None # Detailed internal status: 'valid', 'invalid', 'unknown_temp', 'connect_failed', 'invalid_format', 'invalid_domain', 'unknown_catchall'
+    rcpt_code: Optional[int] = None
+    rcpt_time: Optional[float] = None
+    rcpt_msg: Optional[str] = None
+    data_code: Optional[int] = None
+    data_msg: Optional[str] = None
 
 class VerifyResponse(BaseModel):
     batch_id: Optional[str]
     results: Dict[EmailStr, PerAddressResult]
 
-# SMTP + DNS HELPERS
+class FindEmailByNameRequest(BaseModel):
+    batch_id: Optional[str] = None
+    names_and_domains: List[Tuple[str, str]] # List of (full_name, domain) tuples
+
+class FindEmailByNameResult(BaseModel):
+    full_name: str
+    domain: str
+    found_email: Optional[EmailStr] = None
+    verification_details: Optional[PerAddressResult] = None
+    attempted_patterns: List[str] = []
+    status: str # 'found', 'not_found', 'error'
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# HELPER FUNCTIONS: DNS + ASYNCHRONOUS RAW SMTP PROBES (UNCHANGED)
+# ──────────────────────────────────────────────────────────────────────────────
 
 def get_mx_hosts(domain: str) -> List[str]:
     try:
         answers = dns.resolver.resolve(domain, "MX")
-        mx_list = sorted(((r.preference, r.exchange.to_text().rstrip(".")) for r in answers), key=lambda x: x[0])
-        return [host for _, host in mx_list]
-    except:
-        try: dns.resolver.resolve(domain, "A"); return [domain]
-        except: pass
-        try: dns.resolver.resolve(domain, "AAAA"); return [domain]
-        except: pass
+        mx_list = [(r.preference, r.exchange.to_text().rstrip(".")) for r in answers]
+        mx_list.sort(key=lambda x: x[0])
+        return [host for (_, host) in mx_list]
+    except Exception:
+        try:
+            dns.resolver.resolve(domain, "A")
+            return [domain]
+        except Exception:
+            pass
+        try:
+            dns.resolver.resolve(domain, "AAAA")
+            return [domain]
+        except Exception:
+            pass
     return []
 
-def recv_line(sock: socket.socket) -> str:
-    data = b""
-    while True:
-        ch = sock.recv(1)
-        if not ch: break
-        data += ch
-        if data.endswith(b"\r\n"): break
-    return data.decode(errors="ignore").rstrip("\r\n")
+async def connect_smtp_async(mx_host: str) -> Optional[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
+    reader, writer = None, None
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(mx_host, 25), timeout=SOCKET_TIMEOUT
+        )
+        _ = await recv_line_async(reader)
+        return reader, writer
+    except (asyncio.TimeoutError, ConnectionRefusedError, OSError) as e:
+        if writer: writer.close()
+        return None
+    except Exception as e:
+        if writer: writer.close()
+        return None
 
-def send_line(sock: socket.socket, line: str):
-    sock.sendall((line + "\r\n").encode())
+async def recv_line_async(reader: asyncio.StreamReader) -> Optional[str]:
+    try:
+        data = await asyncio.wait_for(reader.readuntil(b"\r\n"), timeout=SOCKET_TIMEOUT)
+        return data.decode(errors="ignore").rstrip("\r\n")
+    except (asyncio.TimeoutError, asyncio.IncompleteReadError) as e:
+        return None
+    except Exception as e:
+        return None
+
+async def send_line_async(writer: asyncio.StreamWriter, line: str):
+    writer.write((line + "\r\n").encode())
+    await asyncio.wait_for(writer.drain(), timeout=SOCKET_TIMEOUT)
 
 def parse_code(line: str) -> int:
-    try: return int(line[:3])
-    except: return -1
+    try:
+        return int(line[:3])
+    except Exception:
+        return -1
 
-def connect_smtp(mx_host: str) -> socket.socket:
-    sock = socket.create_connection((mx_host, 25), timeout=SOCKET_TIMEOUT)
-    sock.settimeout(SOCKET_TIMEOUT)
-    return sock
-
-def smtp_ehlo(sock: socket.socket, domain: str):
-    send_line(sock, f"EHLO {domain}")
+async def smtp_ehlo_async(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, domain: str):
+    await send_line_async(writer, f"EHLO {domain}")
     while True:
-        line = recv_line(sock)
-        if not line.startswith("250-"): break
+        line = await recv_line_async(reader)
+        if line is None or not line.startswith("250-"):
+            break
 
-def smtp_mail_from(sock: socket.socket, from_addr: str) -> int:
-    send_line(sock, f"MAIL FROM:<{from_addr}>")
-    return parse_code(recv_line(sock))
+async def smtp_mail_from_async(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, from_addr: str) -> int:
+    await send_line_async(writer, f"MAIL FROM:<{from_addr}>")
+    resp = await recv_line_async(reader)
+    return parse_code(resp) if resp else -1
 
-def smtp_rcpt_to(sock: socket.socket, to_addr: str) -> Tuple[int,float,str]:
+async def smtp_rcpt_to_async(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, to_addr: str) -> Tuple[int, float, str]:
     start = time.time()
-    send_line(sock, f"RCPT TO:<{to_addr}>")
-    resp = recv_line(sock)
-    return parse_code(resp), time.time()-start, resp
+    await send_line_async(writer, f"RCPT TO:<{to_addr}>")
+    resp = await recv_line_async(reader)
+    elapsed = time.time() - start
+    return parse_code(resp) if resp else -1, elapsed, resp or ""
 
-def smtp_quit(sock: socket.socket):
-    try: send_line(sock, "QUIT"); recv_line(sock)
-    except: pass
-    finally: sock.close()
+async def smtp_quit_async(writer: asyncio.StreamWriter):
+    try:
+        await send_line_async(writer, "QUIT")
+        writer.close()
+        await writer.wait_closed()
+    except Exception:
+        pass
 
-# CATCH-ALL DETECTION
 
-def detect_catch_all(mx_host: str, domain: str, from_addr: str) -> bool:
-    for _ in range(NUM_CALIBRATE):
-        rand = ''.join(random.choices(string.ascii_lowercase+string.digits,k=10))
-        test_addr = f"{rand}@{domain}"
-        try:
-            sock = connect_smtp(mx_host); recv_line(sock)
-            smtp_ehlo(sock, domain)
-            if smtp_mail_from(sock, from_addr) != 250:
-                smtp_quit(sock)
-                return False
-            for attempt in range(RCPT_RETRIES+1):
-                code, _, _ = smtp_rcpt_to(sock, test_addr)
-                if 500 <= code < 600:
-                    smtp_quit(sock)
-                    return False
-                if 200 <= code < 300:
-                    break
-                if 400 <= code < 500:
-                    time.sleep(0.2*(attempt+1))
+# ──────────────────────────────────────────────────────────────────────────────
+# CATCH-ALL DETECTION (ASYNC) (UNCHANGED)
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def detect_catch_all_async(mx_host: str, domain: str, from_addr: str) -> bool:
+    accepted_count = 0
+    async with mx_semaphores[mx_host]: # Acquire semaphore
+        for _ in range(NUM_CALIBRATE):
+            reader, writer = None, None
+            try:
+                reader, writer = await connect_smtp_async(mx_host)
+                if reader is None or writer is None:
                     continue
-                smtp_quit(sock)
-                return False
-            smtp_quit(sock)
-        except:
-            return False
-    return True
+                await smtp_ehlo_async(reader, writer, domain)
+                code_mail = await smtp_mail_from_async(reader, writer, from_addr)
+                if code_mail != 250:
+                    continue
+                rand_local = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+                test_addr = f"{rand_local}@{domain}"
+                code_rcpt, _, _ = await smtp_rcpt_to_async(reader, writer, test_addr)
+                if 200 <= code_rcpt < 300:
+                    accepted_count += 1
+                elif 500 <= code_rcpt < 600:
+                    return False
+            finally:
+                if writer: await smtp_quit_async(writer)
+            await asyncio.sleep(0.05)
+    return accepted_count == NUM_CALIBRATE
 
-# TIMING-BASED VERIFY
+# ──────────────────────────────────────────────────────────────────────────────
+# TIMING-BASED VALIDATION UNDER CATCH-ALL (ASYNC) (UNCHANGED)
+# ──────────────────────────────────────────────────────────────────────────────
 
-def calibrate_fake_timing(mx_host: str, domain: str, from_addr: str) -> float:
+async def calibrate_fake_timing_async(mx_host: str, domain: str, from_addr: str) -> float:
     times = []
-    for _ in range(NUM_CALIBRATE):
-        rand = ''.join(random.choices(string.ascii_lowercase+string.digits,k=10))
-        addr = f"{rand}@{domain}"
+    async with mx_semaphores[mx_host]: # Acquire semaphore
+        for _ in range(NUM_CALIBRATE):
+            reader, writer = None, None
+            try:
+                reader, writer = await connect_smtp_async(mx_host)
+                if reader is None or writer is None:
+                    continue
+                await smtp_ehlo_async(reader, writer, domain)
+                await smtp_mail_from_async(reader, writer, from_addr)
+                rand_local = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+                test_addr = f"{rand_local}@{domain}"
+                code_rcpt, rcpt_time, _ = await smtp_rcpt_to_async(reader, writer, test_addr)
+                if 200 <= code_rcpt < 300:
+                    times.append(rcpt_time)
+            finally:
+                if writer: await smtp_quit_async(writer)
+            await asyncio.sleep(0.05)
+    return sum(times) / len(times) if times else 0.0
+
+async def verify_with_timing_async(mx_host: str, domain: str, from_addr: str, target_addr: str, avg_fake_time: float) -> PerAddressResult:
+    start_time = time.time()
+    result = PerAddressResult(addr=target_addr)
+    result.method = "timing"
+    result.mx = mx_host
+    result.catch_all = True
+
+    reader, writer = None, None
+    async with mx_semaphores[mx_host]: # Acquire semaphore
         try:
-            sock = connect_smtp(mx_host); recv_line(sock)
-            smtp_ehlo(sock, domain); smtp_mail_from(sock, from_addr)
-            code, elapsed, _ = smtp_rcpt_to(sock, addr)
-            if 200 <= code < 300:
-                times.append(elapsed)
-            smtp_quit(sock)
-        except:
-            pass
-    return sum(times)/len(times) if times else 0.0
+            reader, writer = await connect_smtp_async(mx_host)
+            if reader is None or writer is None:
+                result.status = "connect_failed"
+                return result
+            await smtp_ehlo_async(reader, writer, domain)
+            await smtp_mail_from_async(reader, writer, from_addr)
+            code_rcpt, rcpt_time, rcpt_msg = await smtp_rcpt_to_async(reader, writer, target_addr)
+            result.rcpt_code = code_rcpt
+            result.rcpt_time = rcpt_time
+            result.rcpt_msg = rcpt_msg
 
-# SINGLE-ADDRESS VERIFY
-
-def verify_with_timing(mx_host, domain, from_addr, target, avg):
-    start = time.time()
-    res = PerAddressResult(addr=target, mx=mx_host, method="timing")
-    try:
-        sock = connect_smtp(mx_host); recv_line(sock)
-        smtp_ehlo(sock, domain); smtp_mail_from(sock, from_addr)
-        c, rt, msg = smtp_rcpt_to(sock, target)
-        res.rcpt_code, res.rcpt_time, res.rcpt_msg = c, rt, msg
-        if 500 <= c < 600:
-            res.status = "invalid"
-        elif 400 <= c < 500:
-            res.status = "unknown_temp"
-        else:
-            res.status = "valid" if rt > avg + TIMING_CUSHION else "invalid"
-        smtp_quit(sock)
-    except:
-        res.status = "connect_failed"
-    fill_additional_fields(res, domain, True)
-    res.verification_time = time.time() - start
-    return res
-
-
-def verify_simple(mx_host, domain, from_addr, target):
-    start = time.time()
-    res = PerAddressResult(addr=target, mx=mx_host, method="simple")
-    try:
-        sock = connect_smtp(mx_host); recv_line(sock)
-        smtp_ehlo(sock, domain); smtp_mail_from(sock, from_addr)
-        c, rt, msg = smtp_rcpt_to(sock, target)
-        res.rcpt_code, res.rcpt_time, res.rcpt_msg = c, rt, msg
-        if 500 <= c < 600:
-            res.status = "invalid"
-            smtp_quit(sock)
-        elif 400 <= c < 500:
-            res.status = "unknown_temp"
-            smtp_quit(sock)
-        else:
-            send_line(sock, "DATA")
-            d = recv_line(sock)
-            res.data_code = parse_code(d)
-            res.data_msg = d
-            if d.startswith("354"):
-                send_line(sock, f"Date: {email.utils.formatdate(localtime=False)}")
-                send_line(sock, f"From: <{from_addr}>")
-                send_line(sock, f"To: <{target}>")
-                send_line(sock, "Subject: Test")
-                send_line(sock, f"Message-ID:<{uuid.uuid4().hex}@{domain}>")
-                send_line(sock, "")
-                send_line(sock, "This is a test.")
-                send_line(sock, ".")
-                d2 = recv_line(sock)
-                res.data_code = parse_code(d2)
-                res.data_msg = d2
-                res.status = "valid" if 200 <= res.data_code < 300 else "invalid"
+            if 500 <= code_rcpt < 600:
+                result.status = "invalid"
+            elif 400 <= code_rcpt < 500:
+                result.status = "unknown_temp"
             else:
-                res.status = "unknown"
-        smtp_quit(sock)
-    except:
-        res.status = "connect_failed"
-    fill_additional_fields(res, domain, False)
-    res.verification_time = time.time() - start
-    return res
-
-# ADDITIONAL FIELDS
-
-def infer_mx_provider(mx):
-    m = (mx or "").lower()
-    if "google" in m or m.endswith("gmail.com"): return "Google"
-    if any(x in m for x in ["outlook","office365","hotmail","live"]): return "Microsoft"
-    return "Other"
-
-def infer_free(d): return d.lower() in FREE_MAIL_DOMAINS
-
-def infer_disposable(d): return d.lower() in DISPOSABLE_DOMAINS
-
-def infer_role(local): return local.lower() in ROLE_LOCALS
-
-def infer_deliverability(status): return {"valid":"deliverable","invalid":"undeliverable"}.get(status, "risky")
-
-def infer_score(status): return {"valid":1.0,"invalid":0.0}.get(status, 0.5)
-
-def fill_additional_fields(r, domain, ca):
-    r.mx_provider = infer_mx_provider(r.mx)
-    r.catch_all = ca
-    r.deliverability = infer_deliverability(r.status or "")
-    r.score = infer_score(r.status or "")
-    local = r.addr.split("@",1)[0]
-    r.free = infer_free(domain)
-    r.disposable = infer_disposable(domain)
-    r.role = infer_role(local)
-    r.result = r.status if r.status in ("valid","invalid") else "risky"
-
-# BULK VERIFY
-
-def verify_bulk(addrs: List[str]) -> Dict[str, PerAddressResult]:
-    domains = defaultdict(list)
-    for a in addrs:
-        if "@" not in a:
-            domains[None].append(a)
-        else:
-            local, dom = a.rsplit("@",1)
-            domains[dom].append(a)
-
-    out: Dict[str, PerAddressResult] = {}
-    for dom, alist in domains.items():
-        if dom is None:
-            for a in alist:
-                r = PerAddressResult(addr=a)
-                r.status = "invalid_format"
-                r.mx = None
-                fill_additional_fields(r, dom, False)
-                r.verification_time = 0.0
-                out[a] = r
-            continue
-
-        mxs = get_mx_hosts(dom)
-        if not mxs:
-            for a in alist:
-                r = PerAddressResult(addr=a)
-                r.status = "invalid_domain"
-                r.mx = None
-                fill_additional_fields(r, dom, False)
-                r.verification_time = 0.0
-                out[a] = r
-            continue
-
-        mx = mxs[0]
-        from_addr = FROM_ADDRESS_TEMPLATE.format(dom)
-        is_catch = detect_catch_all(mx, dom, from_addr)
-
-        if not is_catch:
-            for a in alist:
-                r = verify_simple(mx, dom, from_addr, a)
-                out[a] = r
-        else:
-            avg = calibrate_fake_timing(mx, dom, from_addr)
-            for a in alist:
-                if avg <= 0:
-                    r = PerAddressResult(addr=a)
-                    r.method = "timing"
-                    r.status = "unknown_catchall"
-                    r.mx = mx
-                    fill_additional_fields(r, dom, True)
-                    r.verification_time = 0.0
-                    out[a] = r
+                if rcpt_time is not None and abs(rcpt_time - avg_fake_time) > TIMING_CUSHION:
+                    result.status = "valid"
                 else:
-                    r = verify_with_timing(mx, dom, from_addr, a, avg)
-                    out[a] = r
-    return out
+                    result.status = "invalid"
+        finally:
+            if writer: await smtp_quit_async(writer)
 
-# API ROUTE
+    fill_additional_fields(result, domain, catch_all=True)
+    result.verification_time = time.time() - start_time
+    return result
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SIMPLE SMTP VALIDATION (NON-CATCH-ALL, ASYNC) (UNCHANGED)
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def verify_simple_async(mx_host: str, domain: str, from_addr: str, target_addr: str) -> PerAddressResult:
+    start_time = time.time()
+    result = PerAddressResult(addr=target_addr)
+    result.method = "simple"
+    result.mx = mx_host
+    result.catch_all = False
+
+    reader, writer = None, None
+    async with mx_semaphores[mx_host]: # Acquire semaphore
+        try:
+            reader, writer = await connect_smtp_async(mx_host)
+            if reader is None or writer is None:
+                result.status = "connect_failed"
+                return result
+
+            await smtp_ehlo_async(reader, writer, domain)
+            await smtp_mail_from_async(reader, writer, from_addr)
+
+            code_rcpt, _, rcpt_msg = await smtp_rcpt_to_async(reader, writer, target_addr)
+            result.rcpt_code = code_rcpt
+            result.rcpt_msg = rcpt_msg
+
+            if 500 <= code_rcpt < 600:
+                result.status = "invalid"
+                return result
+            if 400 <= code_rcpt < 500:
+                result.status = "unknown_temp"
+                return result
+
+            await send_line_async(writer, "DATA")
+            data_resp = await recv_line_async(reader)
+            data_code = parse_code(data_resp)
+            result.data_code = data_code
+            result.data_msg = data_resp
+
+            if 500 <= data_code < 600:
+                result.status = "invalid"
+                return result
+
+            if data_code == 354:
+                await send_line_async(writer, f"Date: {email.utils.formatdate(localtime=False)}")
+                await send_line_async(writer, f"From: <{from_addr}>")
+                await send_line_async(writer, f"To: <{target_addr}>")
+                await send_line_async(writer, "Subject: Verification Test")
+                await send_line_async(writer, f"Message-ID: <{uuid.uuid4().hex}@{domain}>")
+                await send_line_async(writer, "MIME-Version: 1.0")
+                await send_line_async(writer, "Content-Type: text/plain; charset=UTF-8")
+                await send_line_async(writer, "") # Empty line between headers and body
+                await send_line_async(writer, "This is a minimal verification message.")
+                await send_line_async(writer, ".") # End of data marker
+
+                data2_resp = await recv_line_async(reader)
+                data2_code = parse_code(data2_resp)
+                result.data_code = data2_code
+                result.data_msg = data2_resp
+
+                if 200 <= data2_code < 300:
+                    result.status = "valid"
+                elif 500 <= data2_code < 600:
+                    result.status = "invalid"
+                else:
+                    result.status = "unknown_temp"
+            else:
+                result.status = "unknown"
+
+        except Exception:
+            result.status = "connect_failed"
+        finally:
+            if writer:
+                await smtp_quit_async(writer)
+
+    fill_additional_fields(result, domain, catch_all=False)
+    result.verification_time = time.time() - start_time
+    return result
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ADDITIONAL FIELD CALCULATION (UNCHANGED)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def infer_mx_provider(mx_host: str) -> str:
+    mx_lower = (mx_host or "").lower()
+    if "google" in mx_lower or mx_lower.endswith("gmail.com"):
+        return "Google"
+    if "outlook" in mx_lower or "office365" in mx_lower or "hotmail" in mx_lower or "live" in mx_lower:
+        return "Microsoft"
+    return "Other/Unknown"
+
+def infer_free(domain: str) -> bool:
+    return domain.lower() in FREE_MAIL_DOMAINS
+
+def infer_disposable(domain: str) -> bool:
+    return domain.lower() in DISPOSABLE_DOMAINS
+
+def infer_role(local: str) -> bool:
+    return local.lower() in ROLE_LOCALS
+
+def infer_deliverability(status: str) -> str:
+    if status == "valid":
+        return "deliverable"
+    if status == "invalid":
+        return "undeliverable"
+    return "risky"
+
+def infer_score(status: str) -> float:
+    if status == "valid":
+        return 1.0
+    if status == "invalid":
+        return 0.0
+    return 0.5
+
+def fill_additional_fields(result: PerAddressResult, domain: str, catch_all: bool):
+    """
+    Fills in auxiliary fields for the verification result.
+    """
+    result.mx_provider = infer_mx_provider(result.mx or "")
+    result.catch_all = catch_all
+    # Initial deliverability/score based on direct SMTP status
+    result.deliverability = infer_deliverability(result.status or "")
+    result.score = infer_score(result.status or "")
+
+    local_part = result.addr.split("@", 1)[0]
+    result.free = infer_free(domain or "")
+    result.disposable = infer_disposable(domain or "")
+    result.role = infer_role(local_part)
+
+    # Refine overall 'result' field (valid/invalid/risky)
+    if result.status == "valid":
+        if result.catch_all:
+            result.result = "risky_catch_all"
+            result.score = 0.7
+            result.deliverability = "risky"
+        else:
+            result.result = "valid"
+            result.score = 1.0
+            result.deliverability = "deliverable"
+    elif result.status == "invalid":
+        result.result = "invalid"
+        result.score = 0.0
+        result.deliverability = "undeliverable"
+    elif result.status in ["unknown_temp", "connect_failed", "invalid_format", "invalid_domain", "unknown_catchall"]:
+        result.result = "risky"
+        result.score = 0.3
+        result.deliverability = "risky"
+    else:
+        result.result = "risky"
+        result.score = 0.5
+        result.deliverability = "risky"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# EMAIL PATTERN GENERATION
+# ──────────────────────────────────────────────────────────────────────────────
+
+def generate_email_patterns(full_name: str, domain: str) -> List[str]:
+    """
+    Generates a prioritized list of common email address patterns for a given full name and domain.
+    """
+    parts = full_name.lower().strip().split()
+    first_name = parts[0] if parts else ""
+    last_name = parts[-1] if len(parts) > 1 else ""
+    middle_name_initial = parts[1][0] if len(parts) > 2 else "" # Handles "First Middle Last"
+
+    patterns = []
+
+    # Famous and most common patterns (prioritized)
+    if first_name and last_name:
+        patterns.append(f"{first_name}.{last_name}@{domain}") # firstname.lastname@domain.com
+        patterns.append(f"{first_name}{last_name}@{domain}") # firstnamelastname@domain.com
+        patterns.append(f"{first_name[0]}{last_name}@{domain}") # flastname@domain.com (e.g., jsmith)
+        patterns.append(f"{first_name}_{last_name}@{domain}") # firstname_lastname@domain.com
+        patterns.append(f"{last_name}.{first_name}@{domain}") # lastname.firstname@domain.com
+        patterns.append(f"{first_name}.{last_name[0]}@{domain}") # firstname.l@domain.com (e.g., john.d)
+        patterns.append(f"{first_name[0]}.{last_name[0]}@{domain}") # f.l@domain.com (e.g., j.d)
+        patterns.append(f"{first_name}{last_name[0]}@{domain}") # firstnamel@domain.com (e.g., johnd)
+
+    if first_name:
+        patterns.append(f"{first_name}@{domain}") # firstname@domain.com (simple)
+
+    # Patterns with middle initial if applicable
+    if first_name and middle_name_initial and last_name:
+        patterns.append(f"{first_name}.{middle_name_initial}.{last_name}@{domain}") # f.m.l@domain.com
+        patterns.append(f"{first_name}{middle_name_initial}{last_name}@{domain}") # fm.l@domain.com
+        patterns.append(f"{first_name[0]}{middle_name_initial}{last_name}@{domain}") # fmlastname@domain.com (e.g., jprana)
+        patterns.append(f"{first_name[0]}.{middle_name_initial}.{last_name[0]}@{domain}") # f.m.l@domain.com
+
+    # Add some common role-based emails if name patterns don't yield results
+    # These are handled by infer_role in fill_additional_fields but good for brute-forcing
+    # if not found by name
+    # You might want to remove these or move them lower based on your exact priority.
+    # For "finding a person's email", these are less direct.
+    # if len(parts) == 1: # Only if single name given
+    #     patterns.append(f"{first_name}@{domain}")
+
+    # Remove duplicates and maintain order (first occurrence wins)
+    seen = set()
+    unique_patterns = []
+    for email_pattern in patterns:
+        if email_pattern not in seen:
+            unique_patterns.append(email_pattern)
+            seen.add(email_pattern)
+            
+    return unique_patterns
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MAIN ASYNCHRONOUS VERIFICATION LOGIC (UNCHANGED)
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _verify_domain_emails_async(domain: str, addrs: List[str], mx_host: str, from_addr: str) -> Dict[str, PerAddressResult]:
+    """
+    Internal asynchronous helper to verify all emails for a single domain.
+    This runs sequentially for addresses within a domain, but concurrently across domains.
+    """
+    domain_results: Dict[str, PerAddressResult] = {}
+    
+    is_catch_all = await detect_catch_all_async(mx_host, domain, from_addr)
+
+    if not is_catch_all:
+        tasks = [verify_simple_async(mx_host, domain, from_addr, addr) for addr in addrs]
+        results_list = await asyncio.gather(*tasks, return_exceptions=True)
+        for i, res_or_exc in enumerate(results_list):
+            addr = addrs[i]
+            if isinstance(res_or_exc, Exception):
+                res = PerAddressResult(addr=addr, status="unknown_error", result="risky")
+                print(f"Error verifying {addr}: {res_or_exc}")
+            else:
+                res = res_or_exc
+            domain_results[addr] = res
+    else:
+        avg_fake_time = await calibrate_fake_timing_async(mx_host, domain, from_addr)
+        if avg_fake_time <= 0:
+            for addr in addrs:
+                res = PerAddressResult(addr=addr, status="unknown_catchall")
+                res.mx = mx_host
+                fill_additional_fields(res, domain, catch_all=True)
+                res.verification_time = 0.0
+                domain_results[addr] = res
+        else:
+            tasks = [verify_with_timing_async(mx_host, domain, from_addr, addr, avg_fake_time) for addr in addrs]
+            results_list = await asyncio.gather(*tasks, return_exceptions=True)
+            for i, res_or_exc in enumerate(results_list):
+                addr = addrs[i]
+                if isinstance(res_or_exc, Exception):
+                    res = PerAddressResult(addr=addr, status="unknown_error", result="risky")
+                    print(f"Error verifying {addr}: {res_or_exc}")
+                else:
+                    res = res_or_exc
+                domain_results[addr] = res
+    return domain_results
+
+
+async def verify_bulk_async(address_list: List[str]) -> Dict[str, PerAddressResult]:
+    domains = defaultdict(list)
+    for addr_orig in address_list:
+        addr = addr_orig.lower()
+        if "@" not in addr:
+            results[addr_orig] = PerAddressResult(addr=addr_orig, status="invalid_format")
+            fill_additional_fields(results[addr_orig], "", catch_all=False)
+            results[addr_orig].verification_time = 0.0
+            continue # Skip to next address if format invalid
+
+        local, domain = addr.rsplit("@", 1)
+        domains[domain].append(addr_orig)
+
+    results: Dict[str, PerAddressResult] = {}
+    tasks = []
+
+    for domain_key, addrs_for_domain in domains.items():
+        mx_hosts = await asyncio.to_thread(get_mx_hosts, domain_key)
+
+        if not mx_hosts:
+            for addr in addrs_for_domain:
+                results[addr] = PerAddressResult(addr=addr, status="invalid_domain")
+                fill_additional_fields(results[addr], domain_key, catch_all=False)
+                results[addr].verification_time = 0.0
+            continue
+
+        mx_host = mx_hosts[0]
+        from_addr = FROM_ADDRESS_TEMPLATE.format(domain_key)
+
+        tasks.append(_verify_domain_emails_async(domain_key, addrs_for_domain, mx_host, from_addr))
+
+    concurrent_domain_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for domain_res_dict_or_exception in concurrent_domain_results:
+        if isinstance(domain_res_dict_or_exception, Exception):
+            print(f"Error processing a domain task: {domain_res_dict_or_exception}")
+        else:
+            results.update(domain_res_dict_or_exception)
+
+    return results
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# NEW API ROUTE: FIND EMAIL BY NAME
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.post("/find_email_by_name", response_model=List[FindEmailByNameResult])
+async def find_email_by_name_endpoint(request: FindEmailByNameRequest):
+    """
+    Generates common email patterns for a full name and domain,
+    then verifies them, returning the first valid one found.
+    """
+    if len(request.names_and_domains) > 10: # Limit for batch size here
+        raise HTTPException(status_code=400, detail="Maximum 10 name/domain pairs per request for find_email_by_name.")
+
+    all_results: List[FindEmailByNameResult] = []
+
+    # Process each name/domain pair concurrently
+    tasks = []
+    for full_name, domain in request.names_and_domains:
+        tasks.append(_find_single_email_by_name_task(full_name, domain))
+    
+    all_results = await asyncio.gather(*tasks)
+    return all_results
+
+
+async def _find_single_email_by_name_task(full_name: str, domain: str) -> FindEmailByNameResult:
+    """
+    Generates patterns for a single name/domain and verifies them sequentially until one is found.
+    """
+    response = FindEmailByNameResult(full_name=full_name, domain=domain, status="not_found")
+    
+    # 1. Generate patterns
+    patterns = generate_email_patterns(full_name, domain)
+    response.attempted_patterns = patterns # Record all patterns attempted
+
+    if not patterns:
+        response.status = "error"
+        return response
+
+    # 2. Get MX hosts once for the domain
+    mx_hosts = await asyncio.to_thread(get_mx_hosts, domain)
+    if not mx_hosts:
+        response.status = "not_found"
+        response.verification_details = PerAddressResult(
+            addr=f"@{domain}", status="invalid_domain", result="invalid",
+            mx=None, verification_time=0.0
+        )
+        return response
+    mx_host = mx_hosts[0]
+    from_addr = FROM_ADDRESS_TEMPLATE.format(domain)
+
+    # 3. Detect catch-all status once for the domain
+    is_catch_all = await detect_catch_all_async(mx_host, domain, from_addr)
+    avg_fake_time = 0.0
+    if is_catch_all:
+        avg_fake_time = await calibrate_fake_timing_async(mx_host, domain, from_addr)
+        if avg_fake_time <= 0: # Calibration failed
+             response.status = "not_found"
+             response.verification_details = PerAddressResult(
+                addr=f"@{domain}", status="unknown_catchall", result="risky",
+                mx=mx_host, catch_all=True, verification_time=0.0
+             )
+             return response
+
+    # 4. Verify patterns sequentially with early exit
+    for pattern_email in patterns:
+        try:
+            # Perform a full verification for the pattern
+            if not is_catch_all:
+                verification_result = await verify_simple_async(mx_host, domain, from_addr, pattern_email)
+            else:
+                verification_result = await verify_with_timing_async(mx_host, domain, from_addr, pattern_email, avg_fake_time)
+            
+            # Check if the result is considered "valid" or "likely deliverable"
+            if verification_result.result == "valid" or verification_result.result == "risky_catch_all":
+                response.found_email = pattern_email
+                response.verification_details = verification_result
+                response.status = "found"
+                return response # FOUND AND EXIT EARLY!
+
+        except Exception as e:
+            # Log error but don't stop the search for other patterns
+            print(f"Error verifying pattern {pattern_email}: {e}")
+            pass # Continue to next pattern if an error occurs
+
+    return response # No valid email found after trying all patterns
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# EXISTING API ROUTE: BULK VERIFY (UNCHANGED)
+# ──────────────────────────────────────────────────────────────────────────────
+
 @app.post("/verify", response_model=VerifyResponse)
-def batch_verify(req: VerifyRequest):
-    if len(req.emails) > 200:
-        raise HTTPException(status_code=400, detail="Max 200 emails")
-    res = verify_bulk([str(e) for e in req.emails])
-    return VerifyResponse(batch_id=req.batch_id, results=res)
+async def batch_verify(request: VerifyRequest):
+    """
+    API endpoint to batch-verify email addresses.
+    """
+    if len(request.emails) > 200:
+        raise HTTPException(status_code=400, detail="Maximum 200 emails per request.")
+    
+    raw_results = await verify_bulk_async(request.emails)
+    
+    final_results_map = {}
+    for email_req in request.emails:
+        final_results_map[email_req] = raw_results.get(email_req, PerAddressResult(addr=email_req, status="unknown", result="risky", verification_time=0.0))
+    
+    return VerifyResponse(batch_id=request.batch_id, results=final_results_map)
