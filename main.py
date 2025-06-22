@@ -7,7 +7,7 @@ import email.utils
 import uuid
 import asyncio
 from collections import defaultdict
-from typing import List, Optional, Dict, Tuple, Any # Added Any for generic dicts
+from typing import List, Optional, Dict, Tuple, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,7 +21,7 @@ app = FastAPI(
     title="SMTP Email Verifier API",
     description="Batch-verify and find emails by name using SMTP-handshake + timing for catch-all domains, "
                 "with extended metadata and CORS enabled.",
-    version="1.4.0" # Updated version for email finding feature
+    version="1.5.0" # Updated version for improved email finding patterns
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -31,8 +31,8 @@ app = FastAPI(
 origins = [
     "https://bounso.com",
     "http://bounso.com",
-    "https://owlsquad.com", # New domain allowed
-    "http://owlsquad.com",  # New domain allowed (consider if needed for dev/specific cases)
+    "https://owlsquad.com",
+    "http://owlsquad.com",
     # You may add local dev origins here for local development:
     # "http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8000"
 ]
@@ -81,15 +81,13 @@ mx_semaphores: Dict[str, asyncio.Semaphore] = defaultdict(lambda: asyncio.Semaph
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# REQUEST / RESPONSE MODELS
+# REQUEST / RESPONSE MODELS (UNCHANGED, except for new FindEmailByNameRequest/Result)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class VerifyRequest(BaseModel):
     batch_id: Optional[str] = None
     emails: List[EmailStr]
 
-# This defines the structure of results for each email address
-# It's a Pydantic BaseModel for FastAPI
 class PerAddressResult(BaseModel):
     addr: EmailStr
     mx: Optional[str] = None
@@ -219,7 +217,7 @@ async def smtp_quit_async(writer: asyncio.StreamWriter):
 
 async def detect_catch_all_async(mx_host: str, domain: str, from_addr: str) -> bool:
     accepted_count = 0
-    async with mx_semaphores[mx_host]: # Acquire semaphore
+    async with mx_semaphores[mx_host]:
         for _ in range(NUM_CALIBRATE):
             reader, writer = None, None
             try:
@@ -248,7 +246,7 @@ async def detect_catch_all_async(mx_host: str, domain: str, from_addr: str) -> b
 
 async def calibrate_fake_timing_async(mx_host: str, domain: str, from_addr: str) -> float:
     times = []
-    async with mx_semaphores[mx_host]: # Acquire semaphore
+    async with mx_semaphores[mx_host]:
         for _ in range(NUM_CALIBRATE):
             reader, writer = None, None
             try:
@@ -275,7 +273,7 @@ async def verify_with_timing_async(mx_host: str, domain: str, from_addr: str, ta
     result.catch_all = True
 
     reader, writer = None, None
-    async with mx_semaphores[mx_host]: # Acquire semaphore
+    async with mx_semaphores[mx_host]:
         try:
             reader, writer = await connect_smtp_async(mx_host)
             if reader is None or writer is None:
@@ -316,7 +314,7 @@ async def verify_simple_async(mx_host: str, domain: str, from_addr: str, target_
     result.catch_all = False
 
     reader, writer = None, None
-    async with mx_semaphores[mx_host]: # Acquire semaphore
+    async with mx_semaphores[mx_host]:
         try:
             reader, writer = await connect_smtp_async(mx_host)
             if reader is None or writer is None:
@@ -458,50 +456,62 @@ def fill_additional_fields(result: PerAddressResult, domain: str, catch_all: boo
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# EMAIL PATTERN GENERATION
+# EMAIL PATTERN GENERATION (IMPROVED)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def generate_email_patterns(full_name: str, domain: str) -> List[str]:
     """
     Generates a prioritized list of common email address patterns for a given full name and domain.
+    Attempts to parse name into first, middle, last.
     """
-    parts = full_name.lower().strip().split()
-    first_name = parts[0] if parts else ""
-    last_name = parts[-1] if len(parts) > 1 else ""
-    middle_name_initial = parts[1][0] if len(parts) > 2 else "" # Handles "First Middle Last"
+    cleaned_name = full_name.lower().strip().replace("'", "").replace("-", "") # Clean up common non-alpha chars
+    parts = cleaned_name.split()
+
+    first = parts[0] if parts else ""
+    last = parts[-1] if len(parts) > 1 else ""
+    
+    # Handle middle names/initials more carefully.
+    # If there are exactly 3 parts, assume middle_name_or_initial is parts[1]
+    # If more than 3, parts[1:-1] could be middle names, take first initial of first middle name
+    middle_initial = ""
+    if len(parts) > 2:
+        middle_initial = parts[1][0] if parts[1] else "" # First letter of assumed middle part
 
     patterns = []
+    
+    # --- Most Common Patterns ---
+    if first and last:
+        patterns.append(f"{first}.{last}@{domain}")         # firstname.lastname@domain.com
+        patterns.append(f"{first}{last}@{domain}")          # firstnamelastname@domain.com
+        patterns.append(f"{first[0]}{last}@{domain}")       # flastname@domain.com (e.g., jsmith)
+        patterns.append(f"{first}_{last}@{domain}")         # firstname_lastname@domain.com
+        patterns.append(f"{last}.{first}@{domain}")         # lastname.firstname@domain.com
+        patterns.append(f"{first}.{last[0]}@{domain}")      # firstname.l@domain.com (e.g., john.d)
+        patterns.append(f"{first[0]}.{last[0]}@{domain}")   # f.l@domain.com (e.g., j.d)
+        patterns.append(f"{first}{last[0]}@{domain}")       # firstnamel@domain.com (e.g., johnd)
+        patterns.append(f"{last}{first[0]}@{domain}")       # lastnamf@domain.com (e.g., smithj)
 
-    # Famous and most common patterns (prioritized)
-    if first_name and last_name:
-        patterns.append(f"{first_name}.{last_name}@{domain}") # firstname.lastname@domain.com
-        patterns.append(f"{first_name}{last_name}@{domain}") # firstnamelastname@domain.com
-        patterns.append(f"{first_name[0]}{last_name}@{domain}") # flastname@domain.com (e.g., jsmith)
-        patterns.append(f"{first_name}_{last_name}@{domain}") # firstname_lastname@domain.com
-        patterns.append(f"{last_name}.{first_name}@{domain}") # lastname.firstname@domain.com
-        patterns.append(f"{first_name}.{last_name[0]}@{domain}") # firstname.l@domain.com (e.g., john.d)
-        patterns.append(f"{first_name[0]}.{last_name[0]}@{domain}") # f.l@domain.com (e.g., j.d)
-        patterns.append(f"{first_name}{last_name[0]}@{domain}") # firstnamel@domain.com (e.g., johnd)
+    # Simple First or Last Name
+    if first:
+        patterns.append(f"{first}@{domain}")                # firstname@domain.com
+    if last:
+        patterns.append(f"{last}@{domain}")                 # lastname@domain.com
 
-    if first_name:
-        patterns.append(f"{first_name}@{domain}") # firstname@domain.com (simple)
+    # Patterns with middle initial/name (if available and relevant)
+    if first and middle_initial and last:
+        patterns.append(f"{first}{middle_initial}{last}@{domain}") # fmlastname@domain.com (e.g., jprana)
+        patterns.append(f"{first}.{middle_initial}.{last}@{domain}") # f.m.lastname@domain.com
+        patterns.append(f"{first}.{middle_initial}{last}@{domain}") # f.mlastname@domain.com
+        patterns.append(f"{first[0]}{middle_initial}{last[0]}@{domain}") # fml@domain.com (e.g., jpr)
+        patterns.append(f"{first[0]}{middle_initial}.{last}@{domain}") # fm.lastname@domain.com
 
-    # Patterns with middle initial if applicable
-    if first_name and middle_name_initial and last_name:
-        patterns.append(f"{first_name}.{middle_name_initial}.{last_name}@{domain}") # f.m.l@domain.com
-        patterns.append(f"{first_name}{middle_name_initial}{last_name}@{domain}") # fm.l@domain.com
-        patterns.append(f"{first_name[0]}{middle_name_initial}{last_name}@{domain}") # fmlastname@domain.com (e.g., jprana)
-        patterns.append(f"{first_name[0]}.{middle_name_initial}.{last_name[0]}@{domain}") # f.m.l@domain.com
+    # Other common or short forms
+    if first and len(first) > 3:
+        patterns.append(f"{first[:3]}@{domain}") # e.g., har@domain.com
+    if first and last and len(first) > 3 and len(last) > 3:
+        patterns.append(f"{first[:3]}.{last[:3]}@{domain}") # e.g., har.ran@domain.com
 
-    # Add some common role-based emails if name patterns don't yield results
-    # These are handled by infer_role in fill_additional_fields but good for brute-forcing
-    # if not found by name
-    # You might want to remove these or move them lower based on your exact priority.
-    # For "finding a person's email", these are less direct.
-    # if len(parts) == 1: # Only if single name given
-    #     patterns.append(f"{first_name}@{domain}")
-
-    # Remove duplicates and maintain order (first occurrence wins)
+    # Remove duplicates while preserving order
     seen = set()
     unique_patterns = []
     for email_pattern in patterns:
@@ -510,6 +520,7 @@ def generate_email_patterns(full_name: str, domain: str) -> List[str]:
             seen.add(email_pattern)
             
     return unique_patterns
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN ASYNCHRONOUS VERIFICATION LOGIC (UNCHANGED)
@@ -525,19 +536,20 @@ async def _verify_domain_emails_async(domain: str, addrs: List[str], mx_host: st
     is_catch_all = await detect_catch_all_async(mx_host, domain, from_addr)
 
     if not is_catch_all:
+        # Create tasks for concurrent verification within this non-catch-all domain
         tasks = [verify_simple_async(mx_host, domain, from_addr, addr) for addr in addrs]
         results_list = await asyncio.gather(*tasks, return_exceptions=True)
         for i, res_or_exc in enumerate(results_list):
             addr = addrs[i]
             if isinstance(res_or_exc, Exception):
                 res = PerAddressResult(addr=addr, status="unknown_error", result="risky")
-                print(f"Error verifying {addr}: {res_or_exc}")
+                print(f"Error verifying {addr}: {res_or_exc}") # Log error for debugging
             else:
                 res = res_or_exc
             domain_results[addr] = res
     else:
         avg_fake_time = await calibrate_fake_timing_async(mx_host, domain, from_addr)
-        if avg_fake_time <= 0:
+        if avg_fake_time <= 0: # Calibration failed or no accepted fake probes
             for addr in addrs:
                 res = PerAddressResult(addr=addr, status="unknown_catchall")
                 res.mx = mx_host
@@ -545,13 +557,14 @@ async def _verify_domain_emails_async(domain: str, addrs: List[str], mx_host: st
                 res.verification_time = 0.0
                 domain_results[addr] = res
         else:
+            # Create tasks for concurrent verification within this catch-all domain
             tasks = [verify_with_timing_async(mx_host, domain, from_addr, addr, avg_fake_time) for addr in addrs]
             results_list = await asyncio.gather(*tasks, return_exceptions=True)
             for i, res_or_exc in enumerate(results_list):
                 addr = addrs[i]
                 if isinstance(res_or_exc, Exception):
                     res = PerAddressResult(addr=addr, status="unknown_error", result="risky")
-                    print(f"Error verifying {addr}: {res_or_exc}")
+                    print(f"Error verifying {addr}: {res_or_exc}") # Log error for debugging
                 else:
                     res = res_or_exc
                 domain_results[addr] = res
@@ -560,21 +573,25 @@ async def _verify_domain_emails_async(domain: str, addrs: List[str], mx_host: st
 
 async def verify_bulk_async(address_list: List[str]) -> Dict[str, PerAddressResult]:
     domains = defaultdict(list)
+    results: Dict[str, PerAddressResult] = {} # Initialize results dict here
+
     for addr_orig in address_list:
         addr = addr_orig.lower()
         if "@" not in addr:
             results[addr_orig] = PerAddressResult(addr=addr_orig, status="invalid_format")
             fill_additional_fields(results[addr_orig], "", catch_all=False)
             results[addr_orig].verification_time = 0.0
-            continue # Skip to next address if format invalid
+        else:
+            local, domain = addr.rsplit("@", 1)
+            domains[domain].append(addr_orig)
 
-        local, domain = addr.rsplit("@", 1)
-        domains[domain].append(addr_orig)
-
-    results: Dict[str, PerAddressResult] = {}
     tasks = []
-
     for domain_key, addrs_for_domain in domains.items():
+        if domain_key is None: # This block handles invalid format that might have slipped through early
+             # Already handled above if 'continue' was not hit. This should ideally be empty.
+             pass
+
+        # Synchronous MX lookup - running in a threadpool to avoid blocking event loop
         mx_hosts = await asyncio.to_thread(get_mx_hosts, domain_key)
 
         if not mx_hosts:
@@ -636,6 +653,10 @@ async def _find_single_email_by_name_task(full_name: str, domain: str) -> FindEm
 
     if not patterns:
         response.status = "error"
+        response.verification_details = PerAddressResult(
+            addr=f"@{domain}", status="invalid_name_patterns", result="risky",
+            mx=None, verification_time=0.0
+        )
         return response
 
     # 2. Get MX hosts once for the domain
