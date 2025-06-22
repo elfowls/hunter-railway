@@ -2,29 +2,24 @@ import dns.resolver
 import socket
 import ssl
 import time
+import random
+import string
+import email.utils
 import uuid
+from collections import defaultdict
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 
 # FASTAPI SETUP WITH CORS
 app = FastAPI(
     title="SMTP Email Verifier API",
-    description=(
-        "Batch-verify email addresses using SMTP-handshake + timing for catch-all domains, "
-        "with extended metadata and CORS enabled for bounso.com and owlsquad.com."
-    ),
+    description="Batch‐verify email addresses using SMTP‐handshake + timing for catch‐all domains, with extended metadata and CORS enabled for bounso.com.",
     version="1.2.0"
 )
-
-# ADD CORS MIDDLEWARE
-origins = [
-    "https://bounso.com",
-    "http://bounso.com",
-    "https://owlsquad.com",
-    "http://owlsquad.com",
-]
+origins = ["https://bounso.com", "http://bounso.com"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -36,187 +31,301 @@ app.add_middleware(
 # CONFIGURATION
 FROM_ADDRESS_TEMPLATE = "verify@{}"
 SOCKET_TIMEOUT = 5.0
-NUM_CALIBRATE = 3  # number of fake probes for catch-all detection
+NUM_CALIBRATE = 2
+RCPT_RETRIES = 1
 TIMING_CUSHION = 0.05
+FREE_MAIL_DOMAINS = {"gmail.com","yahoo.com","outlook.com","hotmail.com","aol.com","icloud.com","protonmail.com","zoho.com"}
+DISPOSABLE_DOMAINS = {"mailinator.com","10minutemail.com","yopmail.com","tempmail.com","discard.email","guerrillamail.com"}
+ROLE_LOCALS = {"admin","administrator","support","info","sales","marketing","billing","webmaster","postmaster","contact","help","service"}
 
 # MODELS
-def generate_models():
-    class PatternVerifyRequest(BaseModel):
-        full_name: str
-        domain: str
+class VerifyRequest(BaseModel):
+    batch_id: Optional[str]
+    emails: List[EmailStr]
 
-    class PerAddressResult(BaseModel):
-        addr: EmailStr
-        mx: Optional[str] = None
-        method: Optional[str] = None
-        status: Optional[str] = None
-        rcpt_time: Optional[float] = None
-        score: Optional[float] = None
-        catch_all: Optional[bool] = None
+class PerAddressResult(BaseModel):
+    addr: EmailStr
+    mx: Optional[str]
+    mx_provider: Optional[str]
+    deliverability: Optional[str]
+    score: Optional[float]
+    free: Optional[bool]
+    disposable: Optional[bool]
+    role: Optional[bool]
+    catch_all: Optional[bool]
+    result: Optional[str]
+    verification_time: Optional[float]
+    method: Optional[str]
+    status: Optional[str]
+    rcpt_code: Optional[int]
+    rcpt_time: Optional[float]
+    rcpt_msg: Optional[str]
+    data_code: Optional[int]
+    data_msg: Optional[str]
 
-    class PatternVerifyResponse(BaseModel):
-        chosen: PerAddressResult
-        all_results: Dict[str, PerAddressResult]
+class VerifyResponse(BaseModel):
+    batch_id: Optional[str]
+    results: Dict[EmailStr, PerAddressResult]
 
-    return PatternVerifyRequest, PerAddressResult, PatternVerifyResponse
+# SMTP + DNS HELPERS
 
-PatternVerifyRequest, PerAddressResult, PatternVerifyResponse = generate_models()
-
-# PATTERN GENERATION WITH LENGTH CHECKS
-def generate_patterns(full_name: str, domain: str) -> List[str]:
-    parts = full_name.strip().lower().split()
-    if not parts:
-        return []
-
-    first = parts[0]
-    last = parts[-1]
-    f = first[0] if first else ''
-    l = last[0] if last else ''
-
-    patterns: List[str] = []
-    patterns.append(f"{first}@{domain}")
-    patterns.append(f"{last}@{domain}")
-    patterns.append(f"{first}.{last}@{domain}")
-
-    if f and l:
-        patterns.append(f"{f}{l}@{domain}")
-        patterns.append(f"{f}.{l}@{domain}")
-
-    if len(first) >= 2:
-        patterns.append(f"{first[:2]}{last}@{domain}")
-
-    patterns.append(f"{first}_{last}@{domain}")
-    if f:
-        patterns.append(f"{f}_{last}@{domain}")
-
-    if len(first) > 1 and l:
-        patterns.append(f"{f}{first[1]}{l}@{domain}")
-
-    patterns.append(f"{first}{last}@{domain}")
-
-    if len(first) >= 3 and l:
-        patterns.append(f"{first[:3]}.{l}@{domain}")
-
-    return list(dict.fromkeys(patterns))
-
-# SMTP / DNS HELPERS
 def get_mx_hosts(domain: str) -> List[str]:
     try:
         answers = dns.resolver.resolve(domain, "MX")
-        mxs = sorted(
-            ((r.preference, r.exchange.to_text().rstrip("."))) for r in answers
-        )
-        return [h for _, h in mxs]
-    except Exception:
-        for rd in ("A", "AAAA"):
-            try:
-                dns.resolver.resolve(domain, rd)
-                return [domain]
-            except Exception:
-                continue
+        mx_list = sorted(((r.preference, r.exchange.to_text().rstrip(".")) for r in answers), key=lambda x: x[0])
+        return [host for _, host in mx_list]
+    except:
+        try: dns.resolver.resolve(domain, "A"); return [domain]
+        except: pass
+        try: dns.resolver.resolve(domain, "AAAA"); return [domain]
+        except: pass
     return []
 
-def connect_smtp(mx: str, port: int = 25, use_tls: bool = False) -> socket.socket:
-    sock = socket.create_connection((mx, port), timeout=SOCKET_TIMEOUT)
+def recv_line(sock: socket.socket) -> str:
+    data = b""
+    while True:
+        ch = sock.recv(1)
+        if not ch: break
+        data += ch
+        if data.endswith(b"\r\n"): break
+    return data.decode(errors="ignore").rstrip("\r\n")
+
+def send_line(sock: socket.socket, line: str):
+    sock.sendall((line + "\r\n").encode())
+
+def parse_code(line: str) -> int:
+    try: return int(line[:3])
+    except: return -1
+
+def connect_smtp(mx_host: str) -> socket.socket:
+    sock = socket.create_connection((mx_host, 25), timeout=SOCKET_TIMEOUT)
     sock.settimeout(SOCKET_TIMEOUT)
-    if use_tls:
-        sock.sendall(b"EHLO verifier\r\n")
-        sock.sendall(b"STARTTLS\r\n")
-        resp = sock.recv(1024)
-        if not resp.startswith(b"220"):
-            raise RuntimeError("STARTTLS failed")
-        sock = ssl.wrap_socket(sock)
-        sock.settimeout(SOCKET_TIMEOUT)
     return sock
 
-def smtp_ehlo(sock: socket.socket, dom: str):
-    sock.sendall(f"EHLO {dom}\r\n".encode())
+def smtp_ehlo(sock: socket.socket, domain: str):
+    send_line(sock, f"EHLO {domain}")
     while True:
-        ln = sock.recv(1024)
-        if not ln.startswith(b"250-"):
-            break
+        line = recv_line(sock)
+        if not line.startswith("250-"): break
 
-def smtp_rcpt(sock: socket.socket, addr: str) -> (int, float):
+def smtp_mail_from(sock: socket.socket, from_addr: str) -> int:
+    send_line(sock, f"MAIL FROM:<{from_addr}>")
+    return parse_code(recv_line(sock))
+
+def smtp_rcpt_to(sock: socket.socket, to_addr: str) -> Tuple[int,float,str]:
     start = time.time()
-    sock.sendall(f"RCPT TO:<{addr}>\r\n".encode())
-    resp = sock.recv(1024)
-    code = int(resp[:3])
-    return code, time.time() - start
+    send_line(sock, f"RCPT TO:<{to_addr}>")
+    resp = recv_line(sock)
+    return parse_code(resp), time.time()-start, resp
+
+def smtp_quit(sock: socket.socket):
+    try: send_line(sock, "QUIT"); recv_line(sock)
+    except: pass
+    finally: sock.close()
 
 # CATCH-ALL DETECTION
-def detect_catch_all(mx: str, dom: str) -> (bool, float):
-    frm = FROM_ADDRESS_TEMPLATE.format(dom)
-    timings: List[float] = []
+
+def detect_catch_all(mx_host: str, domain: str, from_addr: str) -> bool:
     for _ in range(NUM_CALIBRATE):
-        fake = f"{uuid.uuid4().hex[:8]}@{dom}"
+        rand = ''.join(random.choices(string.ascii_lowercase+string.digits,k=10))
+        test_addr = f"{rand}@{domain}"
         try:
-            sock = connect_smtp(mx, 587, True)
-            smtp_ehlo(sock, dom)
-            sock.sendall(f"MAIL FROM:<{frm}>\r\n".encode()); sock.recv(1024)
-            code, delta = smtp_rcpt(sock, fake)
-            sock.close()
-            if code < 200 or code >= 300:
-                return False, 0.0
-            timings.append(delta)
-        except Exception:
-            return False, 0.0
-    return True, sum(timings)/len(timings)
+            sock = connect_smtp(mx_host); recv_line(sock)
+            smtp_ehlo(sock, domain)
+            if smtp_mail_from(sock, from_addr) != 250:
+                smtp_quit(sock)
+                return False
+            for attempt in range(RCPT_RETRIES+1):
+                code, _, _ = smtp_rcpt_to(sock, test_addr)
+                if 500 <= code < 600:
+                    smtp_quit(sock)
+                    return False
+                if 200 <= code < 300:
+                    break
+                if 400 <= code < 500:
+                    time.sleep(0.2*(attempt+1))
+                    continue
+                smtp_quit(sock)
+                return False
+            smtp_quit(sock)
+        except:
+            return False
+    return True
 
-# SIMPLE & TIMING VERIFY
-def verify_simple(mx: str, dom: str, addr: str) -> PerAddressResult:
+# TIMING-BASED VERIFY
+
+def calibrate_fake_timing(mx_host: str, domain: str, from_addr: str) -> float:
+    times = []
+    for _ in range(NUM_CALIBRATE):
+        rand = ''.join(random.choices(string.ascii_lowercase+string.digits,k=10))
+        addr = f"{rand}@{domain}"
+        try:
+            sock = connect_smtp(mx_host); recv_line(sock)
+            smtp_ehlo(sock, domain); smtp_mail_from(sock, from_addr)
+            code, elapsed, _ = smtp_rcpt_to(sock, addr)
+            if 200 <= code < 300:
+                times.append(elapsed)
+            smtp_quit(sock)
+        except:
+            pass
+    return sum(times)/len(times) if times else 0.0
+
+# SINGLE-ADDRESS VERIFY
+
+def verify_with_timing(mx_host, domain, from_addr, target, avg):
+    start = time.time()
+    res = PerAddressResult(addr=target, mx=mx_host, method="timing")
     try:
-        sock = connect_smtp(mx, 587, True)
-        smtp_ehlo(sock, dom)
-        sock.sendall(f"MAIL FROM:<verify@{dom}>\r\n".encode()); sock.recv(1024)
-        code, _ = smtp_rcpt(sock, addr)
-        sock.close()
-        status = "valid" if 200 <= code < 300 else "invalid"
-        score = 1.0 if status == "valid" else 0.0
-    except Exception:
-        status, score = "connect_failed", 0.0
-    return PerAddressResult(addr=addr, mx=mx, method="simple", status=status, catch_all=False, rcpt_time=None, score=score)
+        sock = connect_smtp(mx_host); recv_line(sock)
+        smtp_ehlo(sock, domain); smtp_mail_from(sock, from_addr)
+        c, rt, msg = smtp_rcpt_to(sock, target)
+        res.rcpt_code, res.rcpt_time, res.rcpt_msg = c, rt, msg
+        if 500 <= c < 600:
+            res.status = "invalid"
+        elif 400 <= c < 500:
+            res.status = "unknown_temp"
+        else:
+            res.status = "valid" if rt > avg + TIMING_CUSHION else "invalid"
+        smtp_quit(sock)
+    except:
+        res.status = "connect_failed"
+    fill_additional_fields(res, domain, True)
+    res.verification_time = time.time() - start
+    return res
 
-def verify_timing(mx: str, dom: str, addr: str, avg: float) -> PerAddressResult:
+
+def verify_simple(mx_host, domain, from_addr, target):
+    start = time.time()
+    res = PerAddressResult(addr=target, mx=mx_host, method="simple")
     try:
-        sock = connect_smtp(mx, 587, True)
-        smtp_ehlo(sock, dom)
-        sock.sendall(f"MAIL FROM:<verify@{dom}>\r\n".encode()); sock.recv(1024)
-        code, delta = smtp_rcpt(sock, addr)
-        sock.close()
-        score = -abs(delta - avg)
-        status = "valid"
-    except Exception:
-        delta, score = None, float('-inf')
-        status = "connect_failed"
-    return PerAddressResult(addr=addr, mx=mx, method="timing", status=status, catch_all=True, rcpt_time=delta, score=score)
+        sock = connect_smtp(mx_host); recv_line(sock)
+        smtp_ehlo(sock, domain); smtp_mail_from(sock, from_addr)
+        c, rt, msg = smtp_rcpt_to(sock, target)
+        res.rcpt_code, res.rcpt_time, res.rcpt_msg = c, rt, msg
+        if 500 <= c < 600:
+            res.status = "invalid"
+            smtp_quit(sock)
+        elif 400 <= c < 500:
+            res.status = "unknown_temp"
+            smtp_quit(sock)
+        else:
+            send_line(sock, "DATA")
+            d = recv_line(sock)
+            res.data_code = parse_code(d)
+            res.data_msg = d
+            if d.startswith("354"):
+                send_line(sock, f"Date: {email.utils.formatdate(localtime=False)}")
+                send_line(sock, f"From: <{from_addr}>")
+                send_line(sock, f"To: <{target}>")
+                send_line(sock, "Subject: Test")
+                send_line(sock, f"Message-ID:<{uuid.uuid4().hex}@{domain}>")
+                send_line(sock, "")
+                send_line(sock, "This is a test.")
+                send_line(sock, ".")
+                d2 = recv_line(sock)
+                res.data_code = parse_code(d2)
+                res.data_msg = d2
+                res.status = "valid" if 200 <= res.data_code < 300 else "invalid"
+            else:
+                res.status = "unknown"
+        smtp_quit(sock)
+    except:
+        res.status = "connect_failed"
+    fill_additional_fields(res, domain, False)
+    res.verification_time = time.time() - start
+    return res
 
-# ENDPOINT
-@app.post("/pattern-verify", response_model=PatternVerifyResponse)
-def pattern_verify(req: PatternVerifyRequest):
-    dom = req.domain.lower().strip()
-    mxs = get_mx_hosts(dom)
-    if not mxs:
-        raise HTTPException(status_code=400, detail=f"No MX record for {dom}")
+# ADDITIONAL FIELDS
 
-    mx = mxs[0]
-    catch_all, avg_time = detect_catch_all(mx, dom)
-    patterns = generate_patterns(req.full_name, dom)
-    if not patterns:
-        raise HTTPException(status_code=400, detail="Could not generate any email patterns from full_name")
+def infer_mx_provider(mx):
+    m = (mx or "").lower()
+    if "google" in m or m.endswith("gmail.com"): return "Google"
+    if any(x in m for x in ["outlook","office365","hotmail","live"]): return "Microsoft"
+    return "Other"
 
-    results: Dict[str, PerAddressResult] = {}
+def infer_free(d): return d.lower() in FREE_MAIL_DOMAINS
 
-    if not catch_all:
-        last_res = None
-        for p in patterns:
-            res = verify_simple(mx, dom, p)
-            results[p] = res
-            last_res = res
-            if res.status == "valid":
-                return PatternVerifyResponse(chosen=res, all_results=results)
-        return PatternVerifyResponse(chosen=last_res, all_results=results)
+def infer_disposable(d): return d.lower() in DISPOSABLE_DOMAINS
 
-    for p in patterns:
-        results[p] = verify_timing(mx, dom, p, avg_time)
-    chosen = max(results.values(), key=lambda r: r.score or float('-inf'))
-    return PatternVerifyResponse(chosen=chosen, all_results=results)
+def infer_role(local): return local.lower() in ROLE_LOCALS
+
+def infer_deliverability(status): return {"valid":"deliverable","invalid":"undeliverable"}.get(status, "risky")
+
+def infer_score(status): return {"valid":1.0,"invalid":0.0}.get(status, 0.5)
+
+def fill_additional_fields(r, domain, ca):
+    r.mx_provider = infer_mx_provider(r.mx)
+    r.catch_all = ca
+    r.deliverability = infer_deliverability(r.status or "")
+    r.score = infer_score(r.status or "")
+    local = r.addr.split("@",1)[0]
+    r.free = infer_free(domain)
+    r.disposable = infer_disposable(domain)
+    r.role = infer_role(local)
+    r.result = r.status if r.status in ("valid","invalid") else "risky"
+
+# BULK VERIFY
+
+def verify_bulk(addrs: List[str]) -> Dict[str, PerAddressResult]:
+    domains = defaultdict(list)
+    for a in addrs:
+        if "@" not in a:
+            domains[None].append(a)
+        else:
+            local, dom = a.rsplit("@",1)
+            domains[dom].append(a)
+
+    out: Dict[str, PerAddressResult] = {}
+    for dom, alist in domains.items():
+        if dom is None:
+            for a in alist:
+                r = PerAddressResult(addr=a)
+                r.status = "invalid_format"
+                r.mx = None
+                fill_additional_fields(r, dom, False)
+                r.verification_time = 0.0
+                out[a] = r
+            continue
+
+        mxs = get_mx_hosts(dom)
+        if not mxs:
+            for a in alist:
+                r = PerAddressResult(addr=a)
+                r.status = "invalid_domain"
+                r.mx = None
+                fill_additional_fields(r, dom, False)
+                r.verification_time = 0.0
+                out[a] = r
+            continue
+
+        mx = mxs[0]
+        from_addr = FROM_ADDRESS_TEMPLATE.format(dom)
+        is_catch = detect_catch_all(mx, dom, from_addr)
+
+        if not is_catch:
+            for a in alist:
+                r = verify_simple(mx, dom, from_addr, a)
+                out[a] = r
+        else:
+            avg = calibrate_fake_timing(mx, dom, from_addr)
+            for a in alist:
+                if avg <= 0:
+                    r = PerAddressResult(addr=a)
+                    r.method = "timing"
+                    r.status = "unknown_catchall"
+                    r.mx = mx
+                    fill_additional_fields(r, dom, True)
+                    r.verification_time = 0.0
+                    out[a] = r
+                else:
+                    r = verify_with_timing(mx, dom, from_addr, a, avg)
+                    out[a] = r
+    return out
+
+# API ROUTE
+@app.post("/verify", response_model=VerifyResponse)
+def batch_verify(req: VerifyRequest):
+    if len(req.emails) > 200:
+        raise HTTPException(status_code=400, detail="Max 200 emails")
+    res = verify_bulk([str(e) for e in req.emails])
+    return VerifyResponse(batch_id=req.batch_id, results=res)
