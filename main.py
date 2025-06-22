@@ -1,28 +1,44 @@
 import dns.resolver
 import socket
-import ssl
 import time
-import uuid
+import random
+import string
 import email.utils
+import uuid
 from collections import defaultdict
-from typing import List, Dict, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
+from typing import List, Optional, Dict
 
 # ──────────────────────────────────────────────────────────────────────────────
-# FASTAPI SETUP & CORS
+# FASTAPI SETUP WITH CORS
 # ──────────────────────────────────────────────────────────────────────────────
+
 app = FastAPI(
-    title="SMTP Pattern-Based Verifier API",
-    description="Generate email patterns from a full name + domain, and verify via SMTP or timing.",
-    version="1.0.0"
+    title="SMTP Email Verifier API",
+    description=(
+        "Batch-verify email addresses using SMTP-handshake + timing for catch-all domains, "
+        "with extended metadata and CORS enabled for bounso.com and owlsquad.com."
+    ),
+    version="1.2.0"
 )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ADD CORS MIDDLEWARE
+# ──────────────────────────────────────────────────────────────────────────────
+
+origins = [
+    "https://bounso.com",
+    "http://bounso.com",
+    "https://owlsquad.com",
+    "http://owlsquad.com",
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -31,105 +47,37 @@ app.add_middleware(
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ──────────────────────────────────────────────────────────────────────────────
+
 FROM_ADDRESS_TEMPLATE = "verify@{}"
-SOCKET_TIMEOUT    = 5.0
-NUM_CALIBRATE     = 3       # three fake RCPT probes for catch-all detection
-TIMING_CUSHION    = 0.05    # tolerance for timing comparisons
-
-FREE_MAIL_DOMAINS = {"gmail.com","yahoo.com","outlook.com","hotmail.com"}
-DISPOSABLE_DOMAINS = {"mailinator.com","10minutemail.com"}
-ROLE_LOCALS = {"admin","info","support","sales"}
+SOCKET_TIMEOUT = 5.0
+NUM_CALIBRATE = 3  # use 3 fakes for catch-all detection
+TIMING_CUSHION = 0.05
 
 # ──────────────────────────────────────────────────────────────────────────────
-# REQUEST / RESPONSE MODELS
+# MODELS
 # ──────────────────────────────────────────────────────────────────────────────
+
 class PatternVerifyRequest(BaseModel):
     full_name: str
     domain: str
 
 class PerAddressResult(BaseModel):
     addr: EmailStr
-    method: str
-    status: str
+    mx: Optional[str] = None
+    method: Optional[str] = None
+    status: Optional[str] = None
     rcpt_time: Optional[float] = None
     score: Optional[float] = None
     catch_all: Optional[bool] = None
 
 class PatternVerifyResponse(BaseModel):
     chosen: PerAddressResult
-    all_results: Optional[Dict[str, PerAddressResult]] = None
-
-# ──────────────────────────────────────────────────────────────────────────────
-# SMTP / DNS HELPERS (same as before)
-# ──────────────────────────────────────────────────────────────────────────────
-def get_mx_hosts(domain: str) -> List[str]:
-    try:
-        answers = dns.resolver.resolve(domain, "MX")
-        return [r.exchange.to_text().rstrip(".") for r in sorted(answers, key=lambda r: r.preference)]
-    except:
-        # fallback A/AAAA
-        for rd in ("A","AAAA"):
-            try:
-                dns.resolver.resolve(domain, rd)
-                return [domain]
-            except:
-                pass
-    return []
-
-def connect_smtp(mx_host: str, port: int=25, use_tls: bool=False) -> socket.socket:
-    s = socket.create_connection((mx_host, port), timeout=SOCKET_TIMEOUT)
-    s.settimeout(SOCKET_TIMEOUT)
-    s.recv(1024)  # banner
-    if use_tls:
-        s.sendall(b"EHLO verifier\r\n")
-        s.sendall(b"STARTTLS\r\n")
-        resp = s.recv(1024)
-        if not resp.startswith(b"220"):
-            raise RuntimeError("STARTTLS failed")
-        s = ssl.wrap_socket(s)
-        s.settimeout(SOCKET_TIMEOUT)
-    return s
-
-def recv_line(s: socket.socket) -> str:
-    buf = b""
-    while not buf.endswith(b"\r\n"):
-        ch = s.recv(1)
-        if not ch:
-            break
-        buf += ch
-    return buf.decode(errors="ignore").rstrip("\r\n")
-
-def send_line(s: socket.socket, line: str):
-    s.sendall((line + "\r\n").encode())
-
-def smtp_ehlo(s: socket.socket, dom: str):
-    send_line(s, f"EHLO {dom}")
-    # drain multi-line
-    while True:
-        ln = recv_line(s)
-        if not ln.startswith("250-"):
-            break
-
-def smtp_mail_from(s: socket.socket, frm: str):
-    send_line(s, f"MAIL FROM:<{frm}>"); recv_line(s)
-
-def smtp_rcpt_to(s: socket.socket, to_addr: str) -> (int, float):
-    start = time.time()
-    send_line(s, f"RCPT TO:<{to_addr}>")
-    resp = recv_line(s)
-    code = int(resp[:3]) if resp and resp[:3].isdigit() else 0
-    return code, time.time() - start
-
-def smtp_quit(s: socket.socket):
-    try:
-        send_line(s, "QUIT")
-        recv_line(s)
-    finally:
-        s.close()
+    all_results: Dict[str, PerAddressResult]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PATTERN GENERATION
 # ──────────────────────────────────────────────────────────────────────────────
+
 def generate_patterns(full_name: str, domain: str) -> List[str]:
     parts = full_name.strip().lower().split()
     first = parts[0]
@@ -142,118 +90,145 @@ def generate_patterns(full_name: str, domain: str) -> List[str]:
         f"{first}.{last}@{domain}",
         f"{f}{l}@{domain}",
         f"{f}.{l}@{domain}",
-        f"{first[0:2]}{last}@{domain}",
+        f"{first[:2]}{last}@{domain}",
         f"{f}.{last}@{domain}",
-        f"{first[0:3]}@{domain}",
+        f"{first}@{domain}",
         f"{first}_{last}@{domain}",
         f"{f}_{last}@{domain}",
-        f"{f}{first[1]}{last[0]}@{domain}",
+        f"{f}{first[1]}{l}@{domain}",
         f"{first}{last}@{domain}",
-        f"{first[0:3]}.{l}@{domain}"
+        f"{first[:3]}.{l}@{domain}",
     ]
-    # remove duplicates and return
+    # dedupe while preserving order
     return list(dict.fromkeys(patterns))
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CATCH-ALL DETECTION (3 fakes)
+# SMTP / DNS HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
-def detect_catch_all(mx: str, frm: str, dom: str) -> (bool, float):
+
+def get_mx_hosts(domain: str) -> List[str]:
+    try:
+        answers = dns.resolver.resolve(domain, "MX")
+        mxs = sorted(
+            ((r.preference, r.exchange.to_text().rstrip("."))) for r in answers
+        )
+        return [h for _, h in mxs]
+    except:
+        for rd in ("A", "AAAA"):
+            try:
+                dns.resolver.resolve(domain, rd)
+                return [domain]
+            except:
+                continue
+    return []
+
+def connect_smtp(mx: str, port: int = 25, use_tls: bool = False) -> socket.socket:
+    sock = socket.create_connection((mx, port), timeout=SOCKET_TIMEOUT)
+    sock.settimeout(SOCKET_TIMEOUT)
+    if use_tls:
+        sock.sendall(b"EHLO verifier\r\n")
+        sock.sendall(b"STARTTLS\r\n")
+        resp = sock.recv(1024)
+        if not resp.startswith(b"220"):
+            raise RuntimeError("STARTTLS failed")
+        sock = ssl.wrap_socket(sock)
+        sock.settimeout(SOCKET_TIMEOUT)
+    return sock
+
+def smtp_ehlo(sock: socket.socket, dom: str):
+    sock.sendall(f"EHLO {dom}\r\n".encode())
+    while True:
+        ln = sock.recv(1024)
+        if not ln.startswith(b"250-"):
+            break
+
+# single RCPT probe
+def smtp_rcpt(sock: socket.socket, addr: str) -> (int, float):
+    start = time.time()
+    sock.sendall(f"RCPT TO:<{addr}>\r\n".encode())
+    resp = sock.recv(1024)
+    code = int(resp[:3])
+    return code, time.time() - start
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CATCH-ALL DETECTION
+# ──────────────────────────────────────────────────────────────────────────────
+
+def detect_catch_all(mx: str, dom: str) -> (bool, float):
+    frm = FROM_ADDRESS_TEMPLATE.format(dom)
     timings = []
     for _ in range(NUM_CALIBRATE):
         fake = f"{uuid.uuid4().hex[:8]}@{dom}"
         try:
-            s = connect_smtp(mx)
-            recv_line(s); smtp_ehlo(s, dom)
-            smtp_mail_from(s, frm)
-            code, delta = smtp_rcpt_to(s, fake)
-            smtp_quit(s)
-            if 200 <= code < 300:
-                timings.append(delta)
-            else:
+            sock = connect_smtp(mx, 587, True)
+            smtp_ehlo(sock, dom)
+            sock.sendall(f"MAIL FROM:<{frm}>\r\n".encode()); sock.recv(1024)
+            code, delta = smtp_rcpt(sock, fake)
+            sock.close()
+            if code < 200 or code >= 300:
                 return False, 0.0
+            timings.append(delta)
         except:
             return False, 0.0
-    return True, sum(timings) / len(timings)
+    return True, sum(timings)/len(timings)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SIMPLE VERIFY (RCPT-only)
+# SIMPLE vs TIMING VERIFY
 # ──────────────────────────────────────────────────────────────────────────────
-def verify_simple(mx: str, frm: str, dom: str, addr: str) -> PerAddressResult:
+
+def verify_simple(mx: str, dom: str, addr: str) -> PerAddressResult:
     try:
-        s = connect_smtp(mx)
-        recv_line(s); smtp_ehlo(s, dom)
-        smtp_mail_from(s, frm)
-        code, delta = smtp_rcpt_to(s, addr)
-        smtp_quit(s)
+        sock = connect_smtp(mx, 587, True)
+        smtp_ehlo(sock, dom)
+        sock.sendall(f"MAIL FROM:<verify@{dom}>\r\n".encode()); sock.recv(1024)
+        code, _ = smtp_rcpt(sock, addr)
+        sock.close()
         status = "valid" if 200 <= code < 300 else "invalid"
     except:
-        status, delta = "connect_failed", 0.0
-    return PerAddressResult(
-        addr=addr, method="simple", status=status,
-        rcpt_time=delta, score=(1.0 if status=="valid" else 0.0),
-        catch_all=False
-    )
-
-# ──────────────────────────────────────────────────────────────────────────────
-# TIMING VERIFY (single RCPT + compare to avg)
-# ──────────────────────────────────────────────────────────────────────────────
-def verify_timing(mx: str, frm: str, dom: str, addr: str, avg: float) -> PerAddressResult:
-    try:
-        s = connect_smtp(mx)
-        recv_line(s); smtp_ehlo(s, dom)
-        smtp_mail_from(s, frm)
-        code, delta = smtp_rcpt_to(s, addr)
-        smtp_quit(s)
-        # closer to avg ⇒ more likely real
-        diff = abs(delta - avg)
-        status = "valid"  # catch-all always accepts
-    except:
-        delta, diff = 0.0, float("inf")
         status = "connect_failed"
-    return PerAddressResult(
-        addr=addr, method="timing", status=status,
-        rcpt_time=delta, score=-diff,  # negative diff so higher is better
-        catch_all=True
-    )
+    return PerAddressResult(addr=addr, mx=mx, method="simple", status=status,
+                            catch_all=False, rcpt_time=None, score=1.0 if status=="valid" else 0.0)
+
+def verify_timing(mx: str, dom: str, addr: str, avg: float) -> PerAddressResult:
+    try:
+        sock = connect_smtp(mx, 587, True)
+        smtp_ehlo(sock, dom)
+        sock.sendall(f"MAIL FROM:<verify@{dom}>\r\n".encode()); sock.recv(1024)
+        code, delta = smtp_rcpt(sock, addr)
+        sock.close()
+        score = -abs(delta - avg)
+        status = "valid"
+    except:
+        status, score = "connect_failed", float('-inf')
+    return PerAddressResult(addr=addr, mx=mx, method="timing", status=status,
+                            catch_all=True, rcpt_time=delta, score=score)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # NEW ENDPOINT
 # ──────────────────────────────────────────────────────────────────────────────
+
 @app.post("/pattern-verify", response_model=PatternVerifyResponse)
 def pattern_verify(req: PatternVerifyRequest):
     dom = req.domain.lower()
-    mx_hosts = get_mx_hosts(dom)
-    if not mx_hosts:
-        raise HTTPException(400, f"No MX/A record for domain {dom}")
-    mx = mx_hosts[0]
-    frm = FROM_ADDRESS_TEMPLATE.format(dom)
+    mxs = get_mx_hosts(dom)
+    if not mxs:
+        raise HTTPException(400, f"No MX record for {dom}")
+    mx = mxs[0]
 
-    # 1) detect catch-all
-    is_ca, avg = detect_catch_all(mx, frm, dom)
-
-    # 2) generate all patterns
+    ca, avg = detect_catch_all(mx, dom)
     patterns = generate_patterns(req.full_name, dom)
+    results = {}
 
-    results: Dict[str, PerAddressResult] = {}
-
-    if not is_ca:
-        # simple mode: try each until valid
+    if not ca:
         for p in patterns:
-            res = verify_simple(mx, frm, dom, p)
+            res = verify_simple(mx, dom, p)
             results[p] = res
             if res.status == "valid":
-                return PatternVerifyResponse(chosen=res)
-        # none valid:
-        # return the last attempt
-        last = results[patterns[-1]]
-        return PatternVerifyResponse(chosen=last, all_results=results)
+                return PatternVerifyResponse(chosen=res, all_results=results)
+        # none valid
+        return PatternVerifyResponse(chosen=res, all_results=results)
 
-    # catch-all: timing mode
-    # verify every pattern to get diff-based score
     for p in patterns:
-        res = verify_timing(mx, frm, dom, p, avg)
-        results[p] = res
-
-    # pick the one with max score (i.e. smallest timing diff)
-    chosen_addr = max(results.values(), key=lambda r: r.score)
-    return PatternVerifyResponse(chosen=chosen_addr, all_results=results)
+        results[p] = verify_timing(mx, dom, p, avg)
+    chosen = max(results.values(), key=lambda r: r.score)
+    return PatternVerifyResponse(chosen=chosen, all_results=results)
