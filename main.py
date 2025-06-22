@@ -490,6 +490,8 @@ def generate_email_patterns(full_name: str, domain: str) -> List[str]:
         patterns.append(f"{first[0]}.{last[0]}@{domain}")   # f.l@domain.com (e.g., j.d)
         patterns.append(f"{first}{last[0]}@{domain}")       # firstnamel@domain.com (e.g., johnd)
         patterns.append(f"{last}{first[0]}@{domain}")       # lastnamf@domain.com (e.g., smithj)
+        patterns.append(f"{first[0]}{last[0]}@{domain}")    # js@domain.com
+        patterns.append(f"{first[0]}.{last}@{domain}")     # j.smith@domain.com
 
     # Simple First or Last Name
     if first:
