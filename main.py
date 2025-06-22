@@ -1,12 +1,9 @@
+```python
 import dns.resolver
 import socket
+import ssl
 import time
-import random
-import string
-import email.utils
 import uuid
-from collections import defaultdict
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
@@ -50,7 +47,7 @@ app.add_middleware(
 
 FROM_ADDRESS_TEMPLATE = "verify@{}"
 SOCKET_TIMEOUT = 5.0
-NUM_CALIBRATE = 3  # use 3 fakes for catch-all detection
+NUM_CALIBRATE = 3  # number of fake probes for catch-all detection
 TIMING_CUSHION = 0.05
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -75,31 +72,51 @@ class PatternVerifyResponse(BaseModel):
     all_results: Dict[str, PerAddressResult]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# PATTERN GENERATION
+# PATTERN GENERATION (with length checks)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def generate_patterns(full_name: str, domain: str) -> List[str]:
     parts = full_name.strip().lower().split()
+    if not parts:
+        return []
+
     first = parts[0]
     last = parts[-1]
-    f = first[0]
-    l = last[0]
-    patterns = [
-        f"{first}@{domain}",
-        f"{last}@{domain}",
-        f"{first}.{last}@{domain}",
-        f"{f}{l}@{domain}",
-        f"{f}.{l}@{domain}",
-        f"{first[:2]}{last}@{domain}",
-        f"{f}.{last}@{domain}",
-        f"{first}@{domain}",
-        f"{first}_{last}@{domain}",
-        f"{f}_{last}@{domain}",
-        f"{f}{first[1]}{l}@{domain}",
-        f"{first}{last}@{domain}",
-        f"{first[:3]}.{l}@{domain}",
-    ]
-    # dedupe while preserving order
+    f = first[0] if len(first) >= 1 else ''
+    l = last[0] if len(last) >= 1 else ''
+
+    patterns: List[str] = []
+    # basic full-name patterns
+    patterns.append(f"{first}@{domain}")
+    patterns.append(f"{last}@{domain}")
+    patterns.append(f"{first}.{last}@{domain}")
+
+    # initials
+    if f and l:
+        patterns.append(f"{f}{l}@{domain}")
+        patterns.append(f"{f}.{l}@{domain}")
+
+    # two-letter prefix
+    if len(first) >= 2:
+        patterns.append(f"{first[:2]}{last}@{domain}")
+
+    # underscore variants
+    patterns.append(f"{first}_{last}@{domain}")
+    if f:
+        patterns.append(f"{f}_{last}@{domain}")
+
+    # combined letter patterns
+    if len(first) > 1 and l:
+        patterns.append(f"{f}{first[1]}{l}@{domain}")
+
+    # concatenations
+    patterns.append(f"{first}{last}@{domain}")
+
+    # three-letter dot patterns
+    if len(first) >= 3 and l:
+        patterns.append(f"{first[:3]}.{l}@{domain}")
+
+    # remove duplicates, preserve order
     return list(dict.fromkeys(patterns))
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -113,14 +130,16 @@ def get_mx_hosts(domain: str) -> List[str]:
             ((r.preference, r.exchange.to_text().rstrip("."))) for r in answers
         )
         return [h for _, h in mxs]
-    except:
+    except Exception:
+        # fallback to A/AAAA
         for rd in ("A", "AAAA"):
             try:
                 dns.resolver.resolve(domain, rd)
                 return [domain]
-            except:
+            except Exception:
                 continue
     return []
+
 
 def connect_smtp(mx: str, port: int = 25, use_tls: bool = False) -> socket.socket:
     sock = socket.create_connection((mx, port), timeout=SOCKET_TIMEOUT)
@@ -135,6 +154,7 @@ def connect_smtp(mx: str, port: int = 25, use_tls: bool = False) -> socket.socke
         sock.settimeout(SOCKET_TIMEOUT)
     return sock
 
+
 def smtp_ehlo(sock: socket.socket, dom: str):
     sock.sendall(f"EHLO {dom}\r\n".encode())
     while True:
@@ -142,7 +162,7 @@ def smtp_ehlo(sock: socket.socket, dom: str):
         if not ln.startswith(b"250-"):
             break
 
-# single RCPT probe
+
 def smtp_rcpt(sock: socket.socket, addr: str) -> (int, float):
     start = time.time()
     sock.sendall(f"RCPT TO:<{addr}>\r\n".encode())
@@ -156,7 +176,7 @@ def smtp_rcpt(sock: socket.socket, addr: str) -> (int, float):
 
 def detect_catch_all(mx: str, dom: str) -> (bool, float):
     frm = FROM_ADDRESS_TEMPLATE.format(dom)
-    timings = []
+    timings: List[float] = []
     for _ in range(NUM_CALIBRATE):
         fake = f"{uuid.uuid4().hex[:8]}@{dom}"
         try:
@@ -165,15 +185,17 @@ def detect_catch_all(mx: str, dom: str) -> (bool, float):
             sock.sendall(f"MAIL FROM:<{frm}>\r\n".encode()); sock.recv(1024)
             code, delta = smtp_rcpt(sock, fake)
             sock.close()
+            # if RCPT rejects, not catch-all
             if code < 200 or code >= 300:
                 return False, 0.0
             timings.append(delta)
-        except:
+        except Exception:
             return False, 0.0
-    return True, sum(timings)/len(timings)
+    avg = sum(timings) / len(timings)
+    return True, avg
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SIMPLE vs TIMING VERIFY
+# SIMPLE VS TIMING VERIFY
 # ──────────────────────────────────────────────────────────────────────────────
 
 def verify_simple(mx: str, dom: str, addr: str) -> PerAddressResult:
@@ -184,10 +206,14 @@ def verify_simple(mx: str, dom: str, addr: str) -> PerAddressResult:
         code, _ = smtp_rcpt(sock, addr)
         sock.close()
         status = "valid" if 200 <= code < 300 else "invalid"
-    except:
-        status = "connect_failed"
-    return PerAddressResult(addr=addr, mx=mx, method="simple", status=status,
-                            catch_all=False, rcpt_time=None, score=1.0 if status=="valid" else 0.0)
+        score = 1.0 if status == "valid" else 0.0
+    except Exception:
+        status, score = "connect_failed", 0.0
+    return PerAddressResult(
+        addr=addr, mx=mx, method="simple", status=status,
+        catch_all=False, rcpt_time=None, score=score
+    )
+
 
 def verify_timing(mx: str, dom: str, addr: str, avg: float) -> PerAddressResult:
     try:
@@ -196,12 +222,16 @@ def verify_timing(mx: str, dom: str, addr: str, avg: float) -> PerAddressResult:
         sock.sendall(f"MAIL FROM:<verify@{dom}>\r\n".encode()); sock.recv(1024)
         code, delta = smtp_rcpt(sock, addr)
         sock.close()
+        # score closer to avg => higher
         score = -abs(delta - avg)
         status = "valid"
-    except:
-        status, score = "connect_failed", float('-inf')
-    return PerAddressResult(addr=addr, mx=mx, method="timing", status=status,
-                            catch_all=True, rcpt_time=delta, score=score)
+    except Exception:
+        delta, score = None, float('-inf')
+        status = "connect_failed"
+    return PerAddressResult(
+        addr=addr, mx=mx, method="timing", status=status,
+        catch_all=True, rcpt_time=delta, score=score
+    )
 
 # ──────────────────────────────────────────────────────────────────────────────
 # NEW ENDPOINT
@@ -209,26 +239,34 @@ def verify_timing(mx: str, dom: str, addr: str, avg: float) -> PerAddressResult:
 
 @app.post("/pattern-verify", response_model=PatternVerifyResponse)
 def pattern_verify(req: PatternVerifyRequest):
-    dom = req.domain.lower()
+    dom = req.domain.lower().strip()
     mxs = get_mx_hosts(dom)
     if not mxs:
-        raise HTTPException(400, f"No MX record for {dom}")
+        raise HTTPException(status_code=400, detail=f"No MX record for {dom}")
+
     mx = mxs[0]
-
-    ca, avg = detect_catch_all(mx, dom)
+    catch_all, avg_time = detect_catch_all(mx, dom)
     patterns = generate_patterns(req.full_name, dom)
-    results = {}
+    if not patterns:
+        raise HTTPException(status_code=400, detail="Could not generate any email patterns from full_name")
 
-    if not ca:
+    results: Dict[str, PerAddressResult] = {}
+
+    if not catch_all:
+        last_res = None
         for p in patterns:
             res = verify_simple(mx, dom, p)
             results[p] = res
+            last_res = res
             if res.status == "valid":
                 return PatternVerifyResponse(chosen=res, all_results=results)
-        # none valid
-        return PatternVerifyResponse(chosen=res, all_results=results)
+        # if none valid, return the last attempted
+        return PatternVerifyResponse(chosen=last_res, all_results=results)
 
+    # catch-all case: use timing
     for p in patterns:
-        results[p] = verify_timing(mx, dom, p, avg)
-    chosen = max(results.values(), key=lambda r: r.score)
+        results[p] = verify_timing(mx, dom, p, avg_time)
+    # pick highest score
+    chosen = max(results.values(), key=lambda r: r.score or float('-inf'))
     return PatternVerifyResponse(chosen=chosen, all_results=results)
+```
