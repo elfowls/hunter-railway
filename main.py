@@ -33,6 +33,9 @@ origins = [
     "http://bounso.com",
     "https://owlsquad.com",
     "http://owlsquad.com",
+    "https://clay.com.com",
+    "http://clay.com.com",
+    "https://app.clay.com",
     # You may add local dev origins here for local development:
     # "http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8000"
 ]
