@@ -438,8 +438,8 @@ def fill_additional_fields(result: PerAddressResult, domain: str, catch_all: boo
     if result.status == "valid":
         if result.catch_all:
             result.result = "risky_catch_all"
-            result.score = 0.7
-            result.deliverability = "risky"
+            result.score = 0.96
+            result.deliverability = "deliverable"
         else:
             result.result = "valid"
             result.score = 1.0
